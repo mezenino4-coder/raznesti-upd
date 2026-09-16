@@ -33,7 +33,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create v1.0.0 plan_app/dist/*.exe `
-            --title "Разнести УПД" `
-            --notes "Готовый exe для Windows (OCR-модели вшиты, Python не нужен)." `
-            --clobber
+          gh release create v1.0.0 plan_app/dist/*.exe --title "Разнести УПД" --notes "Готовый exe для Windows (Python не нужен)."
