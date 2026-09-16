@@ -30,13 +30,7 @@ from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
 import annotate
 import core
 
-def _base_dir():
-    if getattr(sys, "frozen", False):
-        return Path(sys._MEIPASS)
-    return Path(__file__).resolve().parent.parent
-
-
-MODEL_DIR = _base_dir() / "ocr_rus" / "models"
+MODEL_DIR = Path(__file__).resolve().parent.parent / "ocr_rus" / "models"
 DEFAULT_PASSWORD = "2232"
 
 
@@ -56,23 +50,12 @@ def preprocess_scan(path):
     img = Image.open(path).convert("RGB")
     gray = img.convert("L")
 
-    def text_bands(im):
-        a = np.array(im)
-        dens = (a < 170).sum(axis=1) / max(1, a.shape[1])
-        runs = 0
-        prev = False
-        for d in dens:
-            t = bool(d >= 0.03)
-            if t and not prev:
-                runs += 1
-            prev = t
-        return runs
-
-    best = max((0, 90, 180, 270),
-               key=lambda a: text_bands(gray.rotate(a, expand=True)))
+    # та же ориентация, что и при вписывании заказов (annotate) —
+    # чтобы координаты OCR совпадали с координатами вписывания.
+    gray2, best = annotate._auto_orient(gray)
     if best:
         img = img.rotate(best, expand=True)
-        gray = gray.rotate(best, expand=True)
+        gray = gray2
 
     # небольшой наклон (deskew) — проекционный метод из annotate
     try:

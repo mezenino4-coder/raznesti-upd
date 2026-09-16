@@ -36,21 +36,22 @@ def _cluster(v, gap):
     return b
 
 
-def _text_bands(im):
+def _horiz_proj_var(im):
+    """Дисперсия горизонтальной проекции тёмных пикселей.
+
+    У правильно ориентированного документа текст и строки таблицы идут
+    горизонтально → плотность тёмных пикселей сильно меняется по строкам
+    (большая дисперсия). У повёрнутого на 90° — почти равномерно по строкам.
+    Максимум дисперсии = правильная ориентация (надёжнее, чем подсчёт «полос»).
+    """
     a = np.array(im)
-    dens = (a < DARK).sum(axis=1) / max(1, a.shape[1])
-    runs = 0
-    prev = False
-    for d in dens:
-        t = bool(d >= 0.03)
-        if t and not prev:
-            runs += 1
-        prev = t
-    return runs
+    h, w = a.shape
+    dens = (a < DARK).sum(axis=1) / max(1, w)
+    return float(dens.var())
 
 
 def _auto_orient(im):
-    scores = {a: _text_bands(im.rotate(a, expand=True)) for a in (0, 90, 180, 270)}
+    scores = {a: _horiz_proj_var(im.rotate(a, expand=True)) for a in (0, 90, 180, 270)}
     best = max(scores, key=scores.get)
     return im.rotate(best, expand=True), best
 
