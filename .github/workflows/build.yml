@@ -32,5 +32,7 @@ jobs:
       - name: Upload to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
         run: |
+          gh release delete v1.0.0 --yes --cleanup-tag 2>$null
           gh release create v1.0.0 plan_app/dist/*.exe --title "Разнести УПД" --notes "Готовый exe для Windows (Python не нужен)."
