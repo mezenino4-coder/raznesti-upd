@@ -1,0 +1,6 @@
+rapidocr
+onnxruntime
+msoffcrypto-tool
+openpyxl
+thefuzz
+Pillow
