@@ -30,7 +30,13 @@ from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
 import annotate
 import core
 
-MODEL_DIR = Path(__file__).resolve().parent.parent / "ocr_rus" / "models"
+def _base_dir():
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parent.parent
+
+
+MODEL_DIR = _base_dir() / "ocr_rus" / "models"
 DEFAULT_PASSWORD = "2232"
 
 
