@@ -10,26 +10,33 @@
 - пришло > суммарно жёлтого → излишек в оранжевые, комментарий «пришло N шт»
 - код не найден точно → нечёткий поиск по имени+коду (thefuzz)
 
+ВАЖНО про сохранение: план содержит диаграммы/картинки. openpyxl при
+пересохранении их выбрасывает → Excel ругается «Ошибка в части содержимого».
+Поэтому изменения пишутся напрямую в XML внутри xlsx (только нужные ячейки),
+все остальные части файла (диаграммы, рисунки, sharedStrings) остаются как есть.
+
 Функции:
     process(plan_path, password, items, upd_no, upd_date, today, out_path) -> report
 """
+import copy
 import io
 import re
+import zipfile
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import msoffcrypto, openpyxl
-from openpyxl.styles import PatternFill
 
 try:
     from thefuzz import fuzz
 except ImportError:
     fuzz = None
 
+NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+
 CYR = {c: l for c, l in zip(
     "АВЕКМНОРСТУХавекмнорстух", "ABEKMHOPCTYXabekmnhopctyx")}
-
-NO_FILL = PatternFill(fill_type=None)
 
 
 def norm_code(s):
@@ -75,28 +82,6 @@ def status_of(ws, r):
     if c == "FFFF0000":
         return "red"
     return "none"
-
-
-def load_plain(path, password):
-    with open(path, "rb") as f:
-        of = msoffcrypto.OfficeFile(f)
-        of.load_key(password=password)
-        buf = io.BytesIO()
-        of.decrypt(buf)
-        buf.seek(0)
-    return openpyxl.load_workbook(buf)
-
-
-def save_encrypted(wb, out_path, password):
-    """Сохранить workbook и зашифровать паролем через msoffcrypto."""
-    tmp = Path(out_path).with_suffix(".plain.xlsx")
-    wb.save(tmp)
-    from msoffcrypto.format.ooxml import OOXMLFile
-    with open(tmp, "rb") as fin, open(out_path, "wb") as fout:
-        of = OOXMLFile(fin)
-        of.encrypt(password, fout)
-    tmp.unlink()
-    return out_path
 
 
 def build_index(ws):
@@ -146,10 +131,170 @@ def fuzzy_find(ncode, name, idx):
     return (best, best_ratio) if best and best_ratio >= 60 else None
 
 
+# --------------------------------------------------------------------------
+# Прямое редактирование xlsx (без потери диаграмм/картинок)
+# --------------------------------------------------------------------------
+
+def decrypt_to_bytes(path, password):
+    with open(path, "rb") as f:
+        of = msoffcrypto.OfficeFile(f)
+        of.load_key(password=password)
+        buf = io.BytesIO()
+        of.decrypt(buf)
+        buf.seek(0)
+    return buf.getvalue()
+
+
+def _col_letter(n):
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _resolve_sheet_path(z, sheet_name):
+    wb = z.read("xl/workbook.xml").decode("utf-8")
+    m = re.search(r'<sheet [^>]*name="%s"[^>]*r:id="([^"]+)"' % re.escape(sheet_name), wb)
+    rid = m.group(1)
+    rels = z.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+    m2 = re.search(r'<Relationship [^>]*Id="%s"[^>]*Target="([^"]+)"' % re.escape(rid), rels)
+    target = m2.group(1)
+    if not target.startswith("xl/"):
+        target = "xl/" + target
+    return target
+
+
+def _build_twin_map(z):
+    """Карта «жёлтый стиль → такой же, но без заливки».
+
+    Возвращает (twin, clones, xf_count):
+      twin   — {index_жёлтого_xf: index_xf_без_заливки}
+      clones — [(new_index, xml_строка)] новые xf, которые надо добавить в styles.xml
+      xf_count — исходное число xf (для пересчёта count)
+    """
+    ET.register_namespace("", "http://schemas.openxmlformats.org/spreadsheetml/2006/main")
+    styles = ET.fromstring(z.read("xl/styles.xml"))
+    xe = styles.find(NS + "cellXfs")
+    xfs = xe.findall(NS + "xf")
+
+    def sig(xf):
+        al = xf.find(NS + "alignment")
+        return (xf.get("numFmtId"), xf.get("fontId"), xf.get("borderId"), xf.get("xfId"),
+                xf.get("applyFont"), xf.get("applyBorder"), xf.get("applyNumberFormat"),
+                xf.get("applyAlignment"), ET.tostring(al) if al is not None else "")
+
+    yellow = [i for i, x in enumerate(xfs) if x.get("fillId") == "2"]
+    twin = {}
+    clones = []
+    next_idx = len(xfs)
+    for i in yellow:
+        si = sig(xfs[i])
+        found = None
+        for j, x in enumerate(xfs):
+            if j != i and x.get("fillId") == "0" and sig(x) == si:
+                found = j
+                break
+        if found is not None:
+            twin[i] = found
+        else:
+            c = copy.deepcopy(xfs[i])
+            c.set("fillId", "0")
+            xmlstr = re.sub(r"\bns0:", "", ET.tostring(c, encoding="unicode"))
+            twin[i] = next_idx
+            clones.append((next_idx, xmlstr))
+            next_idx += 1
+    return twin, clones, len(xfs)
+
+
+def _apply_edits(sheet_xml, twin, cell_ops):
+    """cell_ops: {(row, col): {"unfill": bool, "text": str|None}}"""
+    def cell_re(ref):
+        return re.compile(r'<c r="%s"(?:[^>]*/>|[^>]*>.*?</c>)' % ref, re.S)
+
+    def find_s(cell_xml):
+        m = re.search(r'\bs="(\d+)"', cell_xml)
+        return int(m.group(1)) if m else None
+
+    for (row, col), op in sorted(cell_ops.items()):
+        ref = _col_letter(col) + str(row)
+        m = cell_re(ref).search(sheet_xml)
+        cur_s = None
+        cell_txt = m.group(0) if m else None
+        if cell_txt:
+            cur_s = find_s(cell_txt)
+        new_s = cur_s
+        if op.get("unfill") and cur_s is not None and cur_s in twin:
+            new_s = twin[cur_s]
+        if op.get("text") is not None:
+            txt = (op["text"].replace("&", "&amp;")
+                               .replace("<", "&lt;")
+                               .replace(">", "&gt;"))
+            s_attr = (' s="%d"' % new_s) if new_s is not None else ""
+            new_cell = ('<c r="%s"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
+                        % (ref, s_attr, txt))
+            if m:
+                sheet_xml = sheet_xml[:m.start()] + new_cell + sheet_xml[m.end():]
+            else:
+                row_re = re.compile(r'(<row r="%d"[^>]*>)' % row)
+                rm = row_re.search(sheet_xml)
+                if rm:
+                    end = sheet_xml.index("</row>", rm.start())
+                    sheet_xml = sheet_xml[:end] + new_cell + sheet_xml[end:]
+                else:
+                    sheet_xml = sheet_xml + new_cell
+        elif op.get("unfill") and m and cur_s in twin:
+            new_cell = re.sub(r'\bs="%d"' % cur_s, 's="%d"' % twin[cur_s], cell_txt, count=1)
+            sheet_xml = sheet_xml[:m.start()] + new_cell + sheet_xml[m.end():]
+    return sheet_xml
+
+
+def save_edits_xml(plain_bytes, cell_ops, out_path, password):
+    """Применяет правки к расшифрованному xlsx и шифрует результат паролем."""
+    z = zipfile.ZipFile(io.BytesIO(plain_bytes))
+    sheet_path = _resolve_sheet_path(z, "План")
+    twin, clones, xf_count = _build_twin_map(z)
+
+    sheet_xml = _apply_edits(z.read(sheet_path).decode("utf-8"), twin, cell_ops)
+
+    styles_xml = None
+    if clones:
+        styles_xml = z.read("xl/styles.xml").decode("utf-8")
+        for _idx, xmlstr in clones:
+            xmlstr = re.sub(r"\bns0:", "", xmlstr)
+            styles_xml = styles_xml.replace("</cellXfs>", xmlstr + "</cellXfs>", 1)
+        tag_m = re.search(r"<cellXfs [^>]*>", styles_xml)
+        new_tag = re.sub(r'count="\d+"', 'count="%d"' % (xf_count + len(clones)), tag_m.group(0))
+        styles_xml = styles_xml.replace(tag_m.group(0), new_tag, 1)
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zo:
+        for item in z.infolist():
+            data = z.read(item.filename)
+            if item.filename == sheet_path:
+                data = sheet_xml.encode("utf-8")
+            elif item.filename == "xl/styles.xml" and styles_xml is not None:
+                data = styles_xml.encode("utf-8")
+            zo.writestr(item, data)
+
+    tmp = Path(out_path).with_suffix(".plain.xlsx")
+    tmp.write_bytes(out.getvalue())
+    from msoffcrypto.format.ooxml import OOXMLFile
+    with open(tmp, "rb") as fin, open(out_path, "wb") as fout:
+        OOXMLFile(fin).encrypt(password, fout)
+    tmp.unlink()
+    return out_path
+
+
+# --------------------------------------------------------------------------
+# Основная логика разноса
+# --------------------------------------------------------------------------
+
 def process(plan_path, password, items, upd_no, upd_date, today, out_path,
             stale_days=30):
     """items: list of (code, name, qty). Возвращает (report, orders_list)."""
-    wb = load_plain(plan_path, password)
+    plain = decrypt_to_bytes(plan_path, password)
+    wb = openpyxl.load_workbook(io.BytesIO(plain))
     ws = wb["План"]
     idx = build_index(ws)
     stale_before = today - timedelta(days=stale_days)
@@ -158,6 +303,7 @@ def process(plan_path, password, items, upd_no, upd_date, today, out_path,
     report = []
     orders_list = []
     excess_list = []
+    cell_ops = {}  # {(row, col): {"unfill": bool, "text": str|None}}
     for code, name, arrived in items:
         if not isinstance(arrived, int):
             report.append(f"[{code}] кол-во не определено — пропущено")
@@ -190,10 +336,10 @@ def process(plan_path, password, items, upd_no, upd_date, today, out_path,
             remaining -= alloc
             # снять жёлтую заливку по всей строке (колонки 4..10)
             for c in range(4, 11):
-                cell = ws.cell(row=r["r"], column=c)
-                if _rgb(cell) == "FFFFFF00":
-                    cell.fill = NO_FILL
-            ws.cell(row=r["r"], column=10).value = upd_text
+                op = cell_ops.setdefault((r["r"], c), {"unfill": False, "text": None})
+                op["unfill"] = True
+            op = cell_ops.setdefault((r["r"], 10), {"unfill": False, "text": None})
+            op["text"] = upd_text
             closed += 1
             o = short_order(r["order"])
             if o and o not in _seen:
@@ -206,7 +352,8 @@ def process(plan_path, password, items, upd_no, upd_date, today, out_path,
             need = r["qty"] or 0
             alloc = min(need, remaining)
             remaining -= alloc
-            ws.cell(row=r["r"], column=10).value = f"пришло {alloc} шт ({upd_text})"
+            op = cell_ops.setdefault((r["r"], 10), {"unfill": False, "text": None})
+            op["text"] = f"пришло {alloc} шт ({upd_text})"
             report.append(f"  r{r['r']} оранж→«пришло {alloc} шт» ({upd_text})")
         orders_list.append(item_orders)
         if arrived > yellow_total:
@@ -228,5 +375,5 @@ def process(plan_path, password, items, upd_no, upd_date, today, out_path,
                 f"[{code}] {disp_name}: пришло {arrived}, "
                 f"ожидалось {expected}, излишек {excess} шт")
 
-    save_encrypted(wb, out_path, password)
+    save_edits_xml(plain, cell_ops, out_path, password)
     return report, orders_list
