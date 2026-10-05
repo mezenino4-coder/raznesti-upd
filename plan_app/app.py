@@ -30,20 +30,43 @@ from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
 import annotate
 import core
 
-def _base_dir():
-    if getattr(sys, "frozen", False):
-        return Path(sys._MEIPASS)
-    return Path(__file__).resolve().parent.parent
-
-
-MODEL_DIR = _base_dir() / "ocr_rus" / "models"
 DEFAULT_PASSWORD = "2232"
+
+DET_MODEL = "PP-OCRv6_det_small.onnx"
+REC_MODEL = "cyrillic_PP-OCRv5_rec_mobile.onnx"
+CLS_MODEL = "ch_ppocr_mobile_v2.0_cls_mobile.onnx"
+
+
+def models_dir() -> Path:
+    """Папка с .onnx-моделями OCR. Работает и из исходников, и в PyInstaller-сборке.
+
+    Приоритет:
+      1) папка `models/` рядом с app.py (или внутри _MEIPASS у exe);
+      2) `ocr_rus/models/` на уровень выше (для запуска из исходников).
+    """
+    candidates = []
+    if getattr(sys, "frozen", False):
+        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        candidates += [base / "models", base / "ocr_rus" / "models"]
+    here = Path(__file__).resolve().parent
+    candidates += [
+        here / "models",
+        here.parent / "ocr_rus" / "models",
+    ]
+    for cand in candidates:
+        if (cand / DET_MODEL).exists() and (cand / REC_MODEL).exists():
+            return cand
+    return here / "models"
 
 
 def build_engine():
+    md = models_dir()
     return RapidOCR(params={
-        "Global.model_root_dir": str(MODEL_DIR),
+        "Global.model_root_dir": str(md),
         "Global.use_cls": False,
+        "Det.model_path": str(md / DET_MODEL),
+        "Rec.model_path": str(md / REC_MODEL),
+        "Cls.model_path": str(md / CLS_MODEL),
         "Rec.lang_type": LangRec.CYRILLIC,
         "Rec.ocr_version": OCRVersion.PPOCRV5,
         "Rec.model_type": ModelType.MOBILE,
@@ -145,30 +168,64 @@ def _find_qty(txts, i, n):
     return None
 
 
+def _y_centers(boxes):
+    yc = []
+    if boxes is None:
+        return yc
+    for b in boxes:
+        if b is None:
+            yc.append(None)
+            continue
+        ys = [float(p[1]) for p in b]
+        yc.append((min(ys) + max(ys)) / 2)
+    return yc
+
+
+def _name_nearby(txts, yc, i, y0):
+    """Если код на своей строке, а название перенесено на соседнюю — ищем его ниже."""
+    if y0 is None:
+        return ""
+    for j in range(i + 1, min(i + 14, len(txts))):
+        tj = (txts[j] or "").strip()
+        if not tj:
+            continue
+        yj = yc[j] if j < len(yc) else None
+        if yj is not None and (yj - y0) > 45:
+            break
+        if tj.count(".") >= 3:
+            continue
+        if re.fullmatch(r"[\d\s.,]+", tj):
+            continue
+        if re.search(r"Без НДС|Без НДC|акциз|Итого|Всего|ШТ|Шт", tj):
+            continue
+        if re.search(r"[А-Яа-яЁё]", tj):
+            return tj
+    return ""
+
+
 def parse_items(txts, boxes=None):
     items = []
     n = len(txts)
+    yc = _y_centers(boxes)
+    yc += [None] * (n - len(yc))
     for i, t in enumerate(txts):
         t = (t or "").strip()
         if not t:
             continue
         tokens = t.split()
         code = None
+        k = -1
         for k, tok in enumerate(tokens):
             if tok.count(".") >= 3:
-                code = tok
+                code = tok.rstrip(".,")
                 break
         if code is None:
             continue
-        name = " ".join(tokens[k + 1:])
-        if not name.strip():
-            continue
+        name = " ".join(tokens[k + 1:]).strip()
+        if not name:
+            name = _name_nearby(txts, yc, i, yc[i])
         qty = _find_qty(txts, i, n)
-        y_center = None
-        if boxes is not None and i < len(boxes) and boxes[i] is not None:
-            ys = [float(p[1]) for p in boxes[i]]
-            y_center = (min(ys) + max(ys)) / 2
-        items.append((code, name, qty, y_center))
+        items.append((code, name, qty, yc[i]))
     return items
 
 
