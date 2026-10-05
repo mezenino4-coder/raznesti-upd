@@ -4,10 +4,10 @@
 
 Логика (ТЗ Максима):
 - жёлтый (FFFF00) = «ожидает поставки» — при приходе снимаем заливку
-- «не заказаны» = только оранжевые строки (тема accent6 = F79646)
+- оранжевый («не заказано», theme:9 = F79646) — при приходе снимаем так же
 - разнос по «сроку исполнения» (раньше срок — первым)
 - строки со сроком, истёкшим >=30 дней назад — не трогаем (менеджер забыл)
-- пришло > суммарно жёлтого → излишек в оранжевые, комментарий «пришло N шт»
+- пришло > суммарно жёлтого+оранжевого → излишек
 - код не найден точно → нечёткий поиск по имени+коду (thefuzz)
 
 ВАЖНО про сохранение: план содержит диаграммы/картинки. openpyxl при
@@ -166,10 +166,13 @@ def _resolve_sheet_path(z, sheet_name):
 
 
 def _build_twin_map(z):
-    """Карта «жёлтый стиль → такой же, но без заливки».
+    """Карта «цветной стиль → такой же, но без заливки».
+
+    Обрабатываем жёлтые (fillId 2 = FFFFFF00) И оранжевые «не заказано»
+    (fillId 5 = theme:9) — обе при приходе снимаем.
 
     Возвращает (twin, clones, xf_count):
-      twin   — {index_жёлтого_xf: index_xf_без_заливки}
+      twin   — {index_цветного_xf: index_xf_без_заливки}
       clones — [(new_index, xml_строка)] новые xf, которые надо добавить в styles.xml
       xf_count — исходное число xf (для пересчёта count)
     """
@@ -184,11 +187,11 @@ def _build_twin_map(z):
                 xf.get("applyFont"), xf.get("applyBorder"), xf.get("applyNumberFormat"),
                 xf.get("applyAlignment"), ET.tostring(al) if al is not None else "")
 
-    yellow = [i for i, x in enumerate(xfs) if x.get("fillId") == "2"]
+    colored = [i for i, x in enumerate(xfs) if x.get("fillId") in ("2", "5")]
     twin = {}
     clones = []
     next_idx = len(xfs)
-    for i in yellow:
+    for i in colored:
         si = sig(xfs[i])
         found = None
         for j, x in enumerate(xfs):
@@ -320,21 +323,24 @@ def process(plan_path, password, items, upd_no, upd_date, today, out_path,
 
         active = [r for r in rows if not (
             isinstance(r["deadline"], datetime) and r["deadline"] < stale_before)]
-        yellows = sorted([r for r in active if r["status"] == "yellow"], key=deadline_key)
-        oranges = sorted([r for r in active if r["status"] == "orange"], key=deadline_key)
-        yellow_total = sum(r["qty"] or 0 for r in yellows)
+        # Жёлтые («ожидает поставки») и оранжевые («не заказано») обрабатываем
+        # одинаково: снять заливку + вписать №УПД + заказ в скан.
+        targets = sorted(
+            [r for r in active if r["status"] in ("yellow", "orange")],
+            key=deadline_key)
+        expected_total = sum(r["qty"] or 0 for r in targets)
 
         remaining = arrived
         closed = 0
         item_orders = []
         _seen = set()
-        for r in yellows:
+        for r in targets:
             if remaining <= 0:
                 break
             need = r["qty"] or 0
             alloc = min(need, remaining)
             remaining -= alloc
-            # снять жёлтую заливку по всей строке (колонки 4..10)
+            # снять заливку по всей строке (колонки 4..10)
             for c in range(4, 11):
                 op = cell_ops.setdefault((r["r"], c), {"unfill": False, "text": None})
                 op["unfill"] = True
@@ -345,22 +351,14 @@ def process(plan_path, password, items, upd_no, upd_date, today, out_path,
             if o and o not in _seen:
                 item_orders.append(o)
                 _seen.add(o)
-            report.append(f"  r{r['r']} жёлт→снять заливку + {upd_text} ({alloc}/{need})")
-        for r in oranges:
-            if remaining <= 0:
-                break
-            need = r["qty"] or 0
-            alloc = min(need, remaining)
-            remaining -= alloc
-            op = cell_ops.setdefault((r["r"], 10), {"unfill": False, "text": None})
-            op["text"] = f"пришло {alloc} шт ({upd_text})"
-            report.append(f"  r{r['r']} оранж→«пришло {alloc} шт» ({upd_text})")
+            tag = "жёлт" if r["status"] == "yellow" else "оранж"
+            report.append(f"  r{r['r']} {tag}→снять заливку + {upd_text} ({alloc}/{need})")
         orders_list.append(item_orders)
-        if arrived > yellow_total:
+        if arrived > expected_total:
             disp_name = (rows[0]["name"] if rows else "") or name
-            excess_list.append((code, disp_name, arrived, yellow_total,
-                                arrived - yellow_total))
-        status = f"[{code}]{note} пришло {arrived}: закрыто жёлтых {closed}, "
+            excess_list.append((code, disp_name, arrived, expected_total,
+                                arrived - expected_total))
+        status = f"[{code}]{note} пришло {arrived}: закрыто {closed}, "
         if remaining > 0:
             status += f"ИЗЛИШЕК {remaining} некуда"
         else:
