@@ -50,40 +50,79 @@ def build_engine():
     })
 
 
-def preprocess_scan(path):
-    """Автоповорот (90°) + выравнивание наклона (deskew) скана.
-    Возвращает PNG-байты выровненного изображения для OCR."""
+def _score_text(txts):
+    """Оценка 'осмысленности' текста: кириллические буквы + коды с точками.
+    Повёрнутый на 180° текст OCR читает как мусор («962», «0008») — оценка ~0."""
+    score = 0
+    for t in (txts or []):
+        t = (t or "").strip()
+        if not t:
+            continue
+        cyr = sum(1 for ch in t if ('а' <= ch <= 'я') or ('А' <= ch <= 'Я') or ch in 'ёЁ')
+        if cyr:
+            score += 1 + cyr
+        if t.count(".") >= 3:
+            score += 5
+    return score
+
+
+def _resolve_orientation(engine, img, gray):
+    """Определяет правильный угол поворота скана (0/90/180/270).
+
+    Дисперсия горизонтальной проекции отличает «текст горизонтален» от
+    «текст вертикален», но НЕ отличает верх от низа (90° и 270° дают одинаковую
+    дисперсию). Поэтому среди двух кандидатов (best и best+180) выбираем тот,
+    где OCR на уменьшенной копии читает больше кириллицы и кодов.
+    """
+    scores = {a: annotate._horiz_proj_var(gray.rotate(a, expand=True))
+              for a in (0, 90, 180, 270)}
+    best = max(scores, key=scores.get)
+    candidates = [best, (best + 180) % 360]
+    best_ang, best_score = best, -1
+    for a in candidates:
+        small = img.rotate(a, expand=True)
+        small.thumbnail((1400, 1400), Image.LANCZOS)
+        buf = io.BytesIO()
+        small.save(buf, format="PNG")
+        res = engine(buf.getvalue())
+        sc = _score_text(res.txts)
+        if sc > best_score:
+            best_score, best_ang = sc, a
+    return best_ang
+
+
+def preprocess_scan(path, engine=None):
+    """Автоповорот + выравнивание наклона (deskew) скана.
+    Возвращает (PNG-байты, угол поворота)."""
     img = Image.open(path).convert("RGB")
     gray = img.convert("L")
 
-    # та же ориентация, что и при вписывании заказов (annotate) —
-    # чтобы координаты OCR совпадали с координатами вписывания.
-    gray2, best = annotate._auto_orient(gray)
-    if best:
-        img = img.rotate(best, expand=True)
-        gray = gray2
+    ang = _resolve_orientation(engine, img, gray)
+    if ang:
+        img = img.rotate(ang, expand=True)
+        gray = gray.rotate(ang, expand=True)
 
     # небольшой наклон (deskew) — проекционный метод из annotate
     try:
-        ang = annotate._deskew_angle(gray)
-        if abs(ang) >= 0.1:
-            img = img.rotate(ang, resample=Image.BICUBIC,
+        a = annotate._deskew_angle(gray)
+        if abs(a) >= 0.1:
+            img = img.rotate(a, resample=Image.BICUBIC,
                              fillcolor=(255, 255, 255))
     except Exception:
         pass
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    return buf.getvalue()
+    return buf.getvalue(), ang
 
 
 def ocr_scan(path, engine=None):
     engine = engine or build_engine()
-    data = preprocess_scan(path)
+    data, ang = preprocess_scan(path, engine)
     res = engine(data)
     txts = res.txts if res.txts is not None else []
     boxes = res.boxes if res.boxes is not None else []
-    return txts, boxes
+    return txts, boxes, ang
 
 
 def _find_qty(txts, i, n):
@@ -135,8 +174,14 @@ def parse_items(txts, boxes=None):
 
 def extract_upd(txts):
     full = " ".join(txts)
-    m = re.search(r"№\s*(\d+)", full)
-    num = m.group(1) if m else None
+    # Предпочитаем именно «УПД №NNN», а не ссылки внутри документа
+    # вроде «Счет на оплату №245» (это счёт, не УПД).
+    m = re.search(r"УПД\s*№\s*(\d+)", full, re.IGNORECASE)
+    if m:
+        num = m.group(1)
+    else:
+        m = re.search(r"№\s*(\d+)", full)
+        num = m.group(1) if m else None
     m = re.search(r"от\s*(\d{2}\.\d{2}\.\d{4})", full)
     date = m.group(1) if m else None
     return num, date
@@ -164,18 +209,18 @@ def main():
     today = datetime.now()
 
     print("Читаю сканы (OCR)...")
-    scan_items = []  # [(scan_path, items)]
+    scan_items = []  # [(scan_path, items, angle)]
     upd_no, upd_date = a.upd, a.date
     for sc in a.scans:
         sc = Path(sc)
-        txts, boxes = ocr_scan(sc)
+        txts, boxes, ang = ocr_scan(sc)
         if upd_no is None or upd_date is None:
             n, d = extract_upd(txts)
             upd_no = upd_no or n
             upd_date = upd_date or d
         its = parse_items(txts, boxes)
-        print(f"  {sc.name}: {len(its)} позиций")
-        scan_items.append((sc, its))
+        print(f"  {sc.name}: {len(its)} позиций (поворот {ang}°)")
+        scan_items.append((sc, its, ang))
 
     if upd_no is None or upd_date is None:
         print("Не определил №УПД/дату — укажи --upd и --date")
@@ -186,7 +231,7 @@ def main():
     except ValueError:
         upd_date_short = upd_date
 
-    all_items = [(c, nm, q) for _, its in scan_items for (c, nm, q, y) in its]
+    all_items = [(c, nm, q) for _, its, _ in scan_items for (c, nm, q, y) in its]
     print(f"\nУПД №{upd_no} от {upd_date}. Разношу...\n")
 
     report, orders_list = core.process(
@@ -197,13 +242,13 @@ def main():
     # вписывание номеров заказов в сканы
     print("\nВписываю номера заказов в сканы...")
     offset = 0
-    for sc, its in scan_items:
+    for sc, its, ang in scan_items:
         n = len(its)
         orders = orders_list[offset:offset + n]
         offset += n
         positions = [(its[i][3], ", ".join(orders[i])) for i in range(n)]
         out_scan = sc.with_name(sc.stem + "_с_заказами.png")
-        annotate.annotate(sc, positions, out_scan)
+        annotate.annotate(sc, positions, out_scan, angle=ang)
         print(f"  {sc.name} → {out_scan.name}")
 
     print(f"\nГотово → {a.out} (зашифрован паролем)")

@@ -167,14 +167,14 @@ class App:
             scan_items = []
             upd_no = upd_date = None
             for sc in scan_paths:
-                txts, boxes = ocr_scan(sc, self.engine)
+                txts, boxes, ang = ocr_scan(sc, self.engine)
                 if upd_no is None or upd_date is None:
                     n, d = extract_upd(txts)
                     upd_no = upd_no or n
                     upd_date = upd_date or d
                 its = parse_items(txts, boxes)
                 self.log(f"  {sc.name}: {len(its)} позиций")
-                scan_items.append((sc, its))
+                scan_items.append((sc, its, ang))
                 all_items += [(c, nm, q) for (c, nm, q, y) in its]
 
             if upd_no is None or upd_date is None:
@@ -198,13 +198,13 @@ class App:
 
             self.log("Вписываю номера заказов в сканы...")
             offset = 0
-            for sc, its in scan_items:
+            for sc, its, ang in scan_items:
                 n = len(its)
                 orders = orders_list[offset:offset + n]
                 offset += n
                 positions = [(its[i][3], ", ".join(orders[i])) for i in range(n)]
                 out_scan = sc.with_name(sc.stem + "_с_заказами.png")
-                annotate.annotate(sc, positions, out_scan)
+                annotate.annotate(sc, positions, out_scan, angle=ang)
                 self.log(f"  {sc.name} → {out_scan.name}")
 
             self.log(f"✅ Готово → {out} (зашифрован паролем)")

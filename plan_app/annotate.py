@@ -101,12 +101,20 @@ def _detect_kod_col(gray):
     return centers[0] + 3, centers[1] - 5
 
 
-def annotate(scan_path, positions, out_path):
-    """positions: список (y_center, text); y_center=None или text='' — пропустить."""
+def annotate(scan_path, positions, out_path, angle=None):
+    """positions: список (y_center, text); y_center=None или text='' — пропустить.
+
+    angle — уже определённая при OCR ориентация (0/90/180/270). Если None —
+    определяется заново через _auto_orient (совместимость со старыми вызовами).
+    """
     img = Image.open(scan_path).convert("RGB")
     gray = img.convert("L")
 
-    gray2, ang = _auto_orient(gray)
+    if angle is None:
+        gray2, ang = _auto_orient(gray)
+    else:
+        ang = angle
+        gray2 = gray.rotate(ang, expand=True)
     rgb2 = img.rotate(ang, expand=True)
 
     a = _deskew_angle(gray2)
